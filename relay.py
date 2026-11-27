@@ -1,3 +1,4 @@
+import asyncio
 import re
 from typing import Dict, Optional
 
@@ -6,13 +7,43 @@ from fastapi import FastAPI, WebSocket
 app = FastAPI(title="Remote Screen Relay")
 
 ROOM_RE = re.compile(r"^[A-Z0-9]{4,16}$")
-rooms: Dict[str, Dict[str, Optional[WebSocket]]] = {}
+rooms: Dict[str, Dict[str, object]] = {}
 
 
 @app.get("/")
 @app.get("/health")
 async def health():
     return {"status": "ok", "active_rooms": len(rooms)}
+
+
+async def _forward_worker(room_code: str, target_role: str):
+    """Inoltra i pacchetti binari senza accumulare code se la banda rallenta."""
+    while True:
+        entry = rooms.get(room_code)
+        if not entry:
+            break
+        event: asyncio.Event = entry[f"{target_role}_ev"]
+        await event.wait()
+        event.clear()
+
+        entry = rooms.get(room_code)
+        if not entry:
+            break
+        target_ws: Optional[WebSocket] = entry.get(target_role)
+        queue: list = entry[f"{target_role}_q"]
+        if not queue:
+            continue
+
+        batch = list(queue)
+        queue.clear()
+        if target_ws is None:
+            continue
+
+        for pkt in batch:
+            try:
+                await target_ws.send_bytes(pkt)
+            except Exception:
+                break
 
 
 @app.websocket("/ws/{role}/{room}")
@@ -32,9 +63,17 @@ async def ws_relay(ws: WebSocket, role: str, room: str):
             await ws.close(code=4001)
             return
 
-        rooms[room_code] = {"guest": ws, "controller": None}
+        rooms[room_code] = {
+            "guest": ws,
+            "controller": None,
+            "guest_q": [],
+            "controller_q": [],
+            "guest_ev": asyncio.Event(),
+            "controller_ev": asyncio.Event(),
+        }
         await ws.send_text("READY")
 
+        fwd_task = asyncio.create_task(_forward_worker(room_code, "guest"))
         try:
             while True:
                 msg = await ws.receive()
@@ -43,12 +82,14 @@ async def ws_relay(ws: WebSocket, role: str, room: str):
 
                 data = msg.get("bytes")
                 if data is not None:
-                    ctrl = rooms.get(room_code, {}).get("controller")
-                    if ctrl is not None:
-                        try:
-                            await ctrl.send_bytes(data)
-                        except Exception:
-                            pass
+                    entry = rooms.get(room_code)
+                    if entry and entry.get("controller") is not None:
+                        q: list = entry["controller_q"]
+                        # Se il controller è lento, mantiene al massimo 2 pacchetti per non creare lag
+                        if len(q) >= 2:
+                            del q[:-1]
+                        q.append(data)
+                        entry["controller_ev"].set()
                     continue
 
                 txt = msg.get("text")
@@ -65,6 +106,7 @@ async def ws_relay(ws: WebSocket, role: str, room: str):
         except Exception:
             pass
         finally:
+            fwd_task.cancel()
             entry = rooms.get(room_code)
             if entry and entry.get("guest") is ws:
                 ctrl = entry.get("controller")
@@ -93,7 +135,8 @@ async def ws_relay(ws: WebSocket, role: str, room: str):
         return
 
     entry["controller"] = ws
-    guest_ws = entry["guest"]
+    entry["controller_q"].clear()
+    guest_ws: WebSocket = entry["guest"]
     try:
         await guest_ws.send_text("PEER_JOINED")
         await ws.send_text("CONNECTED")
@@ -105,6 +148,7 @@ async def ws_relay(ws: WebSocket, role: str, room: str):
             pass
         return
 
+    fwd_task = asyncio.create_task(_forward_worker(room_code, "controller"))
     try:
         while True:
             msg = await ws.receive()
@@ -113,12 +157,13 @@ async def ws_relay(ws: WebSocket, role: str, room: str):
 
             data = msg.get("bytes")
             if data is not None:
-                g = rooms.get(room_code, {}).get("guest")
-                if g is not None:
-                    try:
-                        await g.send_bytes(data)
-                    except Exception:
-                        pass
+                entry = rooms.get(room_code)
+                if entry and entry.get("guest") is not None:
+                    q: list = entry["guest_q"]
+                    if len(q) >= 2:
+                        del q[:-1]
+                    q.append(data)
+                    entry["guest_ev"].set()
                 continue
 
             txt = msg.get("text")
@@ -127,9 +172,11 @@ async def ws_relay(ws: WebSocket, role: str, room: str):
     except Exception:
         pass
     finally:
+        fwd_task.cancel()
         entry = rooms.get(room_code)
         if entry and entry.get("controller") is ws:
             entry["controller"] = None
+            entry["controller_q"].clear()
             g = entry.get("guest")
             if g is not None:
                 try:
