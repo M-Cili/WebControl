@@ -17,7 +17,6 @@ async def health():
 
 
 async def _forward_worker(room_code: str, target_role: str):
-    """Inoltra prima i pacchetti di controllo/audio e poi l'ultimo frame video disponibile."""
     ev_key = f"{target_role}_ev"
     ctrl_key = f"{target_role}_ctrl_q"
     vid_key = f"{target_role}_vid"
@@ -70,11 +69,22 @@ async def ws_relay(ws: WebSocket, role: str, room: str):
         return
 
     if role == "guest":
-        existing = rooms.get(room_code)
-        if existing and existing.get("guest") is not None:
-            await ws.send_text("ERR:ROOM_IN_USE")
-            await ws.close(code=4001)
-            return
+        # Se esiste una vecchia connessione Guest appesa sullo stesso ID, la chiude e subentra subito
+        existing = rooms.pop(room_code, None)
+        if existing:
+            old_guest: Optional[WebSocket] = existing.get("guest")
+            old_ctrl: Optional[WebSocket] = existing.get("controller")
+            if old_guest is not None:
+                try:
+                    await old_guest.close(code=4002)
+                except Exception:
+                    pass
+            if old_ctrl is not None:
+                try:
+                    await old_ctrl.send_text("PEER_LEFT")
+                    await old_ctrl.close(code=1000)
+                except Exception:
+                    pass
 
         rooms[room_code] = {
             "guest": ws,
@@ -98,9 +108,8 @@ async def ws_relay(ws: WebSocket, role: str, room: str):
                 data = msg.get("bytes")
                 if data is not None:
                     entry = rooms.get(room_code)
-                    if entry and entry.get("controller") is not None and len(data) > 0:
-                        msg_type = data[0]
-                        if msg_type == 5:  # MSG_FRAME: sovrascrive sempre con l'ultimo frame
+                    if entry and entry.get("guest") is ws and entry.get("controller") is not None and len(data) > 0:
+                        if data[0] == 5:
                             entry["controller_vid"] = data
                         else:
                             cq: list = entry["controller_ctrl_q"]
@@ -146,10 +155,13 @@ async def ws_relay(ws: WebSocket, role: str, room: str):
         await ws.close(code=4004)
         return
 
-    if entry.get("controller") is not None:
-        await ws.send_text("ERR:ROOM_BUSY")
-        await ws.close(code=4009)
-        return
+    # Se c'era un vecchio controller appeso, lo sostituisce
+    old_ctrl = entry.get("controller")
+    if old_ctrl is not None:
+        try:
+            await old_ctrl.close(code=4009)
+        except Exception:
+            pass
 
     entry["controller"] = ws
     entry["controller_ctrl_q"].clear()
